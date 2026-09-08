@@ -1,0 +1,4 @@
+.opencode/
+network-scanner/scans/
+__pycache__/
+*.pyc

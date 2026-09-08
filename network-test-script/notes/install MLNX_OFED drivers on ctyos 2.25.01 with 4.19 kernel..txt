@@ -1,0 +1,46 @@
+# Prz1y edited @ 26/05/11 这是针对 天翼云OS 2.25.01 内核版本 4.19.326-0092.ctl3.x86_64 的安装方式。或者说，整个4.19分支的方式。
+# 英伟达已经不维护这个内核的驱动了，整半天才搞明白怎么才能编译安装好，我真气笑了。。。。。问半天也没人给个答案。。。红温了，真红温了。。。
+# 本来很简单的一个东西，硬生生被这个系统搞的复杂完了，好处是你现在能用mst了，还有高性能的网卡驱动。
+# 驱动下载 ，没法wget你忍一下，劳烦下好拷进机器。这是24.10-3.2.5.0 LTS版，有其他版本需求自行在nv官网寻找。
+# https://www.mellanox.com/page/mlnx_ofed_eula?mtag=linux_sw_drivers&mrequest=downloads&mtype=ofed&mver=MLNX_OFED-24.10-3.2.5.0&mname=MLNX_OFED_LINUX-24.10-3.2.5.0-ctyunos22.06-x86_64.iso
+
+#挂载并打开
+mkdir -p /mnt/ofed
+mount -o ro,loop /root/MLNX_OFED_LINUX-24.10-3.2.5.0-ctyunos22.06-x86_64.iso /mnt/ofed
+cd /mnt/ofed
+
+#安装依赖
+yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r) gcc make perl pciutils elfutils-libelf-devel tar createrepo patch gdb-headless lsof python3-devel automake autoconf libtool rpm-build pciutils-devel fuse-devel
+
+#手动添加内核支持，直接用当前驱动源码编译适用当前内核的版本。 这个distro选项只是为了过驱动的脚本OS版本check。如果问y/n就按y。
+./mlnx_add_kernel_support.sh -m . --make-tgz --distro ctyunos23.01
+
+#当你看到这句话的时候就编译好了
+Created /tmp/MLNX_OFED_LINUX-24.10-3.2.5.0-ctyunos23.01-x86_64-ext.tgz
+
+#回到root
+cd /root
+
+#把编译好的对应内核解压到root
+tar -xvf /tmp/MLNX_OFED_LINUX-24.10-3.2.5.0-ctyunos23.01-x86_64-ext.tgz
+
+#打开文件夹
+cd MLNX_OFED_LINUX-24.10-3.2.5.0-ctyunos23.01-x86_64-ext
+
+#执行驱动安装脚本，这个distro选项只是为了过驱动的脚本OS版本check。按y。
+./mlnxofedinstall --distro ctyunos23.01
+
+#安装完成之后更新initramfs
+dracut -f
+
+#加载新驱动
+/etc/init.d/openibd restart
+
+#检查驱动版本
+ofed_info -s
+
+#驱动版本输出应为
+MLNX_OFED_LINUX-24.10-3.2.5.0:
+
+#重启，然后一切都搞定了。
+reboot now

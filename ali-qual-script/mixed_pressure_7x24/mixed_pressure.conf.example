@@ -1,0 +1,66 @@
+# mixed_pressure_7x24.sh 配置文件范例
+# 复制为 mixed_pressure.conf（与脚本同目录）后按需修改。
+# 所有行都是可选的；未设置的项使用脚本内置默认值。
+
+# ===== 测试时长 =====
+# 测试持续秒数（默认 604800 = 168 小时 = 7x24）
+TOTAL_DURATION_SEC=604800
+
+# ===== CPU =====
+# CPU 压测目标百分比（默认 95；stress-ng 核数 = 总核数 × PCT% − fio 占用）
+#CPU_TARGET_PCT=95
+# 疑似降频判定阈值%（默认 90；任一核频率低于最高频率该比例即标记）
+#CPU_THROTTLE_PCT=90
+
+# ===== 内存 =====
+# 内存压测目标（默认 90；按 MemAvailable 可用内存的百分比，stress-ng --vm-bytes 直接使用该总量）
+#MEM_TARGET_PCT=90
+# 内存压测工具：stress-ng / memtester / auto（默认 stress-ng，按用例要求；auto=优先 memtester）
+#MEM_TOOL="stress-ng"
+# 内存访问模式：all / rand / seq / flip / rowhammer / walk / write（默认 all）
+# 注意：stress-ng >= 0.17 默认 all 会轮换全部 vm 方法，部分方法会额外分配 buffer 的 1/8
+# 临时内存（实测 RSS = 配额 x9/8），高占用配比下会 OOM 硬锁；write(write64) 无额外分配
+MEM_ACCESS_MODE="write"
+
+# ===== 磁盘 / fio =====
+# 显式指定所有系统盘（必填，空格分隔）；脚本不会自动探测系统盘
+# 配置错误或设备不存在时将直接终止，避免误操作系统盘
+SYSTEM_DISKS="/dev/sda"
+# Existing ext4 filesystems are reused only when explicitly enabled.
+ALLOW_EXISTING_FS=true
+# 显式指定测试盘，空格分隔（默认空 = 自动发现）
+# 注意：显式指定后，盘不存在 / 是系统盘 / 准备失败 会直接中止测试，不会回退到文件级模式
+#FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"
+# fio 挂载基础路径（默认 /mnt/fio_pressure；第 2 块盘起追加 _2、_3…）
+#FIO_MOUNT_BASE="/mnt/fio_pressure"
+# 文件级（回退模式）fio 单线程文件大小，MB（默认 10240）
+#FIO_FILE_SIZE_MB=10240
+# 文件级 fio 并发数（默认 1）
+#FIO_FILE_NUMJOBS=1
+# fio 要求版本（默认 3.13，按用例要求）
+#FIO_REQUIRED_VERSION="3.13"
+# 是否强制校验 fio 版本（默认 true；false 时仅告警不退出）
+FIO_VERSION_STRICT=false
+# fio 稳态等待秒数，之后再计算 CPU/内存参数（默认 45）
+#FIO_STEADY_WAIT=45
+
+# ===== 监控 =====
+# OS 内存 / CPU 频率 / 内存带宽采样间隔，秒（默认 10）
+#CSV_MON_INTERVAL=10
+# ipmitool BMC 传感器轮询间隔，秒（默认 600 = 10 分钟）
+#IPMI_MON_INTERVAL=600
+# dmesg 中途快照间隔，秒（默认 1800 = 30 分钟，不清空内核 ring buffer）
+#DMESG_SNAP_INTERVAL=1800
+# 内存带宽监控：auto / off（默认 auto，依赖 perf uncore 计数器；无 perf 自动跳过）
+#MEM_BW_MON="auto"
+
+# ===== 日志处理 =====
+# 启动时旧日志处理：backup（移入 backup_<时间戳>/，默认）/ delete / keep
+#LOG_CLEANUP_MODE="backup"
+# 启动时系统日志策略：backup（保存压测前快照，默认）/ clear（清空 dmesg 和 /var/log/messages）/ none
+#SYSTEM_LOG_ACTION="backup"
+
+# ===== 危险项 =====
+# true = 对测试盘自动 wipefs + 分区 + mkfs.ext4，不再交互确认（默认 false）
+# 测试盘上的数据允许被清除；仅在无人值守且盘位已人工核对时开启
+ALLOW_AUTO_PREPARE=true

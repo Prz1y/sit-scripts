@@ -1,0 +1,439 @@
+==========================================================================
+ 第 1 步: 系统参数调优 [两台机器都执行]
+ 停止 irqbalance 防止中断被重分配; 锁 CPU 最高频; 关 NUMA 自动均衡
+ 避免 8 节点间页面迁移; 设置 TCP 大缓冲区/cubic/fq_codel; 关 RFS
+==========================================================================
+
+systemctl stop irqbalance
+systemctl disable irqbalance
+pkill -9 irqbalance
+
+for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $gov 2>/dev/null; done
+
+sysctl -w kernel.numa_balancing=0
+
+sysctl -w net.core.rmem_max=2147483647
+sysctl -w net.core.wmem_max=2147483647
+sysctl -w net.ipv4.tcp_rmem='4096 87380 2147483647'
+sysctl -w net.ipv4.tcp_wmem='4096 65536 2147483647'
+sysctl -w net.core.netdev_max_backlog=250000
+sysctl -w net.core.somaxconn=65535
+sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sysctl -w net.core.optmem_max=2147483647
+sysctl -w net.ipv4.tcp_timestamps=1
+sysctl -w net.ipv4.tcp_sack=1
+sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+sysctl -w net.ipv4.tcp_mtu_probing=1
+sysctl -w net.core.default_qdisc=fq_codel
+sysctl -w net.ipv4.tcp_congestion_control=cubic
+sysctl -w net.core.netdev_budget=1200
+sysctl -w net.core.netdev_budget_usecs=20000
+sysctl -w net.core.busy_read=50
+sysctl -w net.core.busy_poll=50
+
+sysctl -w net.core.rps_sock_flow_entries=0
+
+
+==========================================================================
+ 第 2 步: 网卡调优 [两台机器都执行, 改成自己的网卡名]
+ MTU 9000 jumbo frame; 7 队列匹配 7 IRQ CPU; ring 8192 防溢出;
+ 固定中断合并 128μs; 全开 offload; RSS 均匀分流;
+ 清除 RPS 避免与硬件 RSS 冲突(实测冲突掉 40G);
+ conntrack NOTRACK 绕过每包连接跟踪开销
+==========================================================================
+
+NIC1=ens2f0np0
+NIC2=ens2f1np1
+
+for NIC in $NIC1 $NIC2; do
+  ip link set dev $NIC mtu 9000
+  ethtool -L $NIC combined 7
+  ethtool -G $NIC rx 8192 tx 8192
+  ethtool -C $NIC adaptive-rx off adaptive-tx off rx-usecs 128 tx-usecs 128
+  ethtool -K $NIC rx on tx on tso on gso on gro on lro on
+  ethtool -K $NIC tx-nocache-copy off
+  ethtool -K $NIC ntuple on rxhash on
+  ethtool -A $NIC rx off tx off
+  ethtool -X $NIC equal 7
+  ethtool -N $NIC rx-flow-hash tcp4 sdfn
+  ethtool -N $NIC rx-flow-hash udp4 sdfn
+done
+
+for NIC in $NIC1 $NIC2; do
+  for f in /sys/class/net/$NIC/queues/rx-*/rps_cpus; do
+    echo 0 > $f 2>/dev/null
+  done
+  echo "已清除 $NIC 所有 RPS"
+done
+
+iptables -t raw -F
+iptables-restore <<'EOF'
+*raw
+:PREROUTING ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A PREROUTING -p tcp --dport 5001:5100 -j NOTRACK
+-A PREROUTING -p tcp --dport 6001:6100 -j NOTRACK
+-A PREROUTING -p tcp --sport 5001:5100 -j NOTRACK
+-A PREROUTING -p tcp --sport 6001:6100 -j NOTRACK
+-A OUTPUT     -p tcp --sport 5001:5100 -j NOTRACK
+-A OUTPUT     -p tcp --sport 6001:6100 -j NOTRACK
+COMMIT
+EOF
+
+
+==========================================================================
+ 第 3 步: IRQ 绑核 [两台机器都执行]
+ 将 NIC1/NIC2 的 mlx5 中断向量分别绑到网卡所在 NUMA 的
+ 前 7 / 后 7 个 CPU, 1:1 对应 7 个队列, 避免跨 NUMA 处理中断
+==========================================================================
+
+cat /sys/class/net/$NIC1/device/numa_node
+
+numactl -H | grep "node 0 cpus:"
+
+numactl -H | grep "node 5 cpus:"
+
+CPUS_NIC1=(0 1 2 3 4 5 6)
+
+PCI=$(basename $(readlink -f /sys/class/net/$NIC1/device))
+i=0
+for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+  echo ${CPUS_NIC1[$((i % 7))]} > /proc/irq/$irq/smp_affinity_list
+  i=$((i+1))
+done
+echo "NIC1 ($NIC1) IRQ 绑核完成: $i 个中断向量"
+
+CPUS_NIC2=(7 8 9 10 11 12 13)
+
+PCI=$(basename $(readlink -f /sys/class/net/$NIC2/device))
+i=0
+for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+  echo ${CPUS_NIC2[$((i % 7))]} > /proc/irq/$irq/smp_affinity_list
+  i=$((i+1))
+done
+echo "NIC2 ($NIC2) IRQ 绑核完成: $i 个中断向量"
+
+
+==========================================================================
+ 第 4 步: 配置 IP 地址 [各机器不同]
+ 25机(服务端) .2, 71机(客户端) .1; 两个子网隔离两个端口的流量
+==========================================================================
+
+ip addr flush dev $NIC1; ip addr add 192.168.100.2/24 dev $NIC1; ip link set $NIC1 up
+ip addr flush dev $NIC2; ip addr add 192.168.110.2/24 dev $NIC2; ip link set $NIC2 up
+
+ip addr show $NIC1 | grep inet
+ip addr show $NIC2 | grep inet
+
+
+==========================================================================
+ 第 5 步: 防火墙放通
+ 放通 iperf 使用的 TCP 端口范围 5001-5016 / 6001-6016
+==========================================================================
+
+firewall-cmd --zone=public --add-port=5001-5016/tcp --permanent 2>/dev/null
+firewall-cmd --zone=public --add-port=6001-6016/tcp --permanent 2>/dev/null
+firewall-cmd --reload 2>/dev/null
+
+iptables -I INPUT 1 -p tcp --dport 5001:5016 -j ACCEPT
+iptables -I INPUT 1 -p tcp --dport 6001:6016 -j ACCEPT
+
+
+==========================================================================
+ 第 6 步: 启动 iperf 服务端 [25机]
+ iperf 进程绑到非 NIC-NUMA 的邻近节点, 避免与 IRQ 争抢 CPU;
+ Pair1/Pair2 分别监听 5001/6001 端口
+==========================================================================
+
+numactl -H
+
+pkill -x iperf
+
+numactl --cpunodebind=4 --membind=4 iperf -s -p 5001 &
+
+numactl --cpunodebind=4 --membind=4 iperf -s -p 6001 &
+
+ss -tulpn | grep -E "5001|6001"
+
+
+==========================================================================
+ 第 7 步: 启动 iperf 客户端测试 [71机]
+ 14 并行流(-P14), 绑定到邻近 NUMA 节点(跳过同 die 最近邻);
+ -l 1M 大写入块减少 87% syscall; -w 4m 窗口填满带宽延迟积;
+ Pair1/Pair2 同时跑, 分别输出到日志
+==========================================================================
+
+ping -c 2 192.168.100.2
+ping -c 2 192.168.110.2
+
+pkill -x iperf
+
+numactl --cpunodebind=1 --membind=1 \
+  iperf -c 192.168.100.2 -p 5001 -P 14 -t 60 -i 5 -w 4m -N \
+  > /tmp/pair1_result.log 2>&1 &
+
+numactl --cpunodebind=1 --membind=1 \
+  iperf -c 192.168.110.2 -p 6001 -P 14 -t 60 -i 5 -w 4m -N \
+  > /tmp/pair2_result.log 2>&1 &
+
+wait
+
+echo "===== Pair1 ====="
+grep '\[SUM\]' /tmp/pair1_result.log | tail -1
+echo "===== Pair2 ====="
+grep '\[SUM\]' /tmp/pair2_result.log | tail -1
+
+
+==========================================================================
+ 测试完毕后还原
+ 恢复 irqbalance、NUMA balancing, 清除 NOTRACK 规则, 停止 iperf
+==========================================================================
+
+systemctl enable irqbalance; systemctl start irqbalance
+sysctl -w kernel.numa_balancing=1
+iptables -t raw -F
+pkill -x iperf
+==========================================================================
+ 第 1 步: 系统参数调优 [两台机器都执行]
+ 停止 irqbalance 防止中断被重分配; 锁 CPU 最高频; 关 NUMA 自动均衡
+ 避免 8 节点间页面迁移; 设置 TCP 大缓冲区/cubic/fq_codel; 关 RFS
+==========================================================================
+
+# ---------- 1.1 停 irqbalance (三重保证) ----------
+systemctl stop irqbalance
+systemctl disable irqbalance
+pkill -9 irqbalance
+
+# ---------- 1.2 CPU performance 模式 ----------
+for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $gov 2>/dev/null; done
+
+# ---------- 1.3 关 NUMA 自动均衡 ----------
+sysctl -w kernel.numa_balancing=0
+
+# ---------- 1.4 TCP / 网络内核参数 ----------
+sysctl -w net.core.rmem_max=2147483647
+sysctl -w net.core.wmem_max=2147483647
+sysctl -w net.ipv4.tcp_rmem='4096 87380 2147483647'
+sysctl -w net.ipv4.tcp_wmem='4096 65536 2147483647'
+sysctl -w net.core.netdev_max_backlog=250000
+sysctl -w net.core.somaxconn=65535
+sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sysctl -w net.core.optmem_max=2147483647
+sysctl -w net.ipv4.tcp_timestamps=1
+sysctl -w net.ipv4.tcp_sack=1
+sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+sysctl -w net.ipv4.tcp_mtu_probing=1
+sysctl -w net.core.default_qdisc=fq_codel
+sysctl -w net.ipv4.tcp_congestion_control=cubic
+sysctl -w net.core.netdev_budget=1200
+sysctl -w net.core.netdev_budget_usecs=20000
+sysctl -w net.core.busy_read=50
+sysctl -w net.core.busy_poll=50
+
+# ---------- 1.5 关 RFS ----------
+sysctl -w net.core.rps_sock_flow_entries=0
+
+
+==========================================================================
+ 第 2 步: 网卡调优 [两台机器都执行, 改成自己的网卡名]
+ MTU 9000 jumbo frame; 7 队列匹配 7 IRQ CPU; ring 8192 防溢出;
+ 固定中断合并 128μs; 全开 offload; RSS 均匀分流;
+ 清除 RPS 避免与硬件 RSS 冲突(实测冲突掉 40G);
+ conntrack NOTRACK 绕过每包连接跟踪开销
+==========================================================================
+
+# 71机 用这两行
+NIC1=ens2f0np0
+NIC2=ens2f1np1
+
+# 25机 用这两行
+# NIC1=ens5f0np0
+# NIC2=ens5f1np1
+
+# ---------- 2.1 MTU / 队列 / 环形缓冲区 / 中断合并 ----------
+for NIC in $NIC1 $NIC2; do
+  ip link set dev $NIC mtu 9000
+  ethtool -L $NIC combined 7
+  ethtool -G $NIC rx 8192 tx 8192
+  ethtool -C $NIC adaptive-rx off adaptive-tx off rx-usecs 128 tx-usecs 128
+  ethtool -K $NIC rx on tx on tso on gso on gro on lro on
+  ethtool -K $NIC tx-nocache-copy off
+  ethtool -K $NIC ntuple on rxhash on
+  ethtool -A $NIC rx off tx off
+  ethtool -X $NIC equal 7
+  ethtool -N $NIC rx-flow-hash tcp4 sdfn
+  ethtool -N $NIC rx-flow-hash udp4 sdfn
+done
+
+# ---------- 2.2 清除 RPS (关键！与硬件 RSS 冲突会掉 40G) ----------
+for NIC in $NIC1 $NIC2; do
+  for f in /sys/class/net/$NIC/queues/rx-*/rps_cpus; do
+    echo 0 > $f 2>/dev/null
+  done
+  echo "已清除 $NIC 所有 RPS"
+done
+
+# ---------- 2.3 conntrack NOTRACK (绕过连接跟踪) ----------
+# 一次性写入 raw 表规则
+iptables -t raw -F
+iptables-restore <<'EOF'
+*raw
+:PREROUTING ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A PREROUTING -p tcp --dport 5001:5100 -j NOTRACK
+-A PREROUTING -p tcp --dport 6001:6100 -j NOTRACK
+-A PREROUTING -p tcp --sport 5001:5100 -j NOTRACK
+-A PREROUTING -p tcp --sport 6001:6100 -j NOTRACK
+-A OUTPUT     -p tcp --sport 5001:5100 -j NOTRACK
+-A OUTPUT     -p tcp --sport 6001:6100 -j NOTRACK
+COMMIT
+EOF
+
+
+==========================================================================
+ 第 3 步: IRQ 绑核 [两台机器都执行]
+ 将 NIC1/NIC2 的 mlx5 中断向量分别绑到网卡所在 NUMA 的
+ 前 7 / 后 7 个 CPU, 1:1 对应 7 个队列, 避免跨 NUMA 处理中断
+==========================================================================
+
+# ★ 先确认 NIC 所在 NUMA ★
+cat /sys/class/net/$NIC1/device/numa_node
+# 71机应输出 0, 25机应输出 5
+
+# ★ 查看该 NUMA 节点的 CPU 列表 ★
+# 71机:
+numactl -H | grep "node 0 cpus:"
+# 25机:
+# numactl -H | grep "node 5 cpus:"
+
+# ---- NIC1 IRQ 绑核 (用该 NUMA 的前 7 个 CPU) ----
+# 把下面的 CPUS 数组换成你看到的实际 CPU 编号前 7 个
+# 例如 71机 NUMA0: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 → 前7个是 0 1 2 3 4 5 6
+CPUS_NIC1=(0 1 2 3 4 5 6)
+
+PCI=$(basename $(readlink -f /sys/class/net/$NIC1/device))
+i=0
+for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+  echo ${CPUS_NIC1[$((i % 7))]} > /proc/irq/$irq/smp_affinity_list
+  i=$((i+1))
+done
+echo "NIC1 ($NIC1) IRQ 绑核完成: $i 个中断向量"
+
+# ---- NIC2 IRQ 绑核 (用该 NUMA 的后 7 个 CPU) ----
+# 例如 71机 NUMA0: → 后7个是 7 8 9 10 11 12 13
+CPUS_NIC2=(7 8 9 10 11 12 13)
+
+PCI=$(basename $(readlink -f /sys/class/net/$NIC2/device))
+i=0
+for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+  echo ${CPUS_NIC2[$((i % 7))]} > /proc/irq/$irq/smp_affinity_list
+  i=$((i+1))
+done
+echo "NIC2 ($NIC2) IRQ 绑核完成: $i 个中断向量"
+
+
+==========================================================================
+ 第 4 步: 配置 IP 地址 [各机器不同]
+ 25机(服务端) .2, 71机(客户端) .1; 两个子网隔离两个端口的流量
+==========================================================================
+
+# ★★★ 25机 (服务端) ★★★
+ip addr flush dev $NIC1; ip addr add 192.168.100.2/24 dev $NIC1; ip link set $NIC1 up
+ip addr flush dev $NIC2; ip addr add 192.168.110.2/24 dev $NIC2; ip link set $NIC2 up
+
+# ★★★ 71机 (客户端) ★★★
+# ip addr flush dev $NIC1; ip addr add 192.168.100.1/24 dev $NIC1; ip link set $NIC1 up
+# ip addr flush dev $NIC2; ip addr add 192.168.110.1/24 dev $NIC2; ip link set $NIC2 up
+
+# 验证:
+ip addr show $NIC1 | grep inet
+ip addr show $NIC2 | grep inet
+
+
+==========================================================================
+ 第 5 步: 防火墙放通
+ 放通 iperf 使用的 TCP 端口范围 5001-5016 / 6001-6016
+==========================================================================
+
+# firewalld (如果在用):
+firewall-cmd --zone=public --add-port=5001-5016/tcp --permanent 2>/dev/null
+firewall-cmd --zone=public --add-port=6001-6016/tcp --permanent 2>/dev/null
+firewall-cmd --reload 2>/dev/null
+
+# 或 iptables:
+iptables -I INPUT 1 -p tcp --dport 5001:5016 -j ACCEPT
+iptables -I INPUT 1 -p tcp --dport 6001:6016 -j ACCEPT
+
+
+==========================================================================
+ 第 6 步: 启动 iperf 服务端 [25机]
+ iperf 进程绑到非 NIC-NUMA 的邻近节点, 避免与 IRQ 争抢 CPU;
+ Pair1/Pair2 分别监听 5001/6001 端口
+==========================================================================
+
+# 先确认最近的 NUMA 节点 (用于跑 iperf, 避免和 IRQ 抢 CPU):
+numactl -H
+# 看 node distances 那一段, 找到离 NUMA 5 距离最小的其他节点号
+# 假设最近的是 NUMA 4, 则用 --cpunodebind=4
+
+# 杀掉旧 iperf
+pkill -x iperf
+
+# Pair1 服务端 (绑定到最近 NUMA, 改成你查到的节点号)
+numactl --cpunodebind=4 --membind=4 iperf -s -p 5001 &
+
+# Pair2 服务端
+numactl --cpunodebind=4 --membind=4 iperf -s -p 6001 &
+
+# 验证:
+ss -tulpn | grep -E "5001|6001"
+
+
+==========================================================================
+ 第 7 步: 启动 iperf 客户端测试 [71机]
+ 14 并行流(-P14), 绑定到邻近 NUMA 节点(跳过同 die 最近邻);
+ -l 1M 大写入块减少 87% syscall; -w 4m 窗口填满带宽延迟积;
+ Pair1/Pair2 同时跑, 分别输出到日志
+==========================================================================
+
+# 先 ping 验证连通性
+ping -c 2 192.168.100.2
+ping -c 2 192.168.110.2
+
+# 杀掉旧 iperf
+pkill -x iperf
+
+# ★ 最近 NUMA: 71机 NIC 在 NUMA 0, 最近邻应该是 NUMA 1
+# 查看: numactl -H 确认
+
+# Pair1 测试 (14 并行流, 60 秒)
+numactl --cpunodebind=1 --membind=1 \
+  iperf -c 192.168.100.2 -p 5001 -P 14 -t 60 -i 5 -w 4m -N \
+  > /tmp/pair1_result.log 2>&1 &
+
+# Pair2 测试 (14 并行流, 60 秒)
+numactl --cpunodebind=1 --membind=1 \
+  iperf -c 192.168.110.2 -p 6001 -P 14 -t 60 -i 5 -w 4m -N \
+  > /tmp/pair2_result.log 2>&1 &
+
+# 等待完成 (约 60 秒)
+wait
+
+# 查看结果:
+echo "===== Pair1 ====="
+grep '\[SUM\]' /tmp/pair1_result.log | tail -1
+echo "===== Pair2 ====="
+grep '\[SUM\]' /tmp/pair2_result.log | tail -1
+
+
+==========================================================================
+ 测试完毕后还原
+ 恢复 irqbalance、NUMA balancing, 清除 NOTRACK 规则, 停止 iperf
+==========================================================================
+
+systemctl enable irqbalance; systemctl start irqbalance
+sysctl -w kernel.numa_balancing=1
+iptables -t raw -F
+pkill -x iperf
